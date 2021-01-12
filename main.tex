@@ -1,0 +1,696 @@
+\documentclass{standalone}
+\usepackage[hidelinks, colorlinks=true, allcolors=blue]{hyperref}
+\usepackage[backend=biber]{biblatex}
+\usepackage[edges]{forest}
+
+
+
+
+\forestset{
+  % This is the style that should be applied in the tree preamble. The problem
+  % of citation nodes is that we effectively want to maintain two related
+  % trees: the category tree and a tier-aligned citation tree. The idea
+  % behind the implementation is the following: while packing a node of the
+  % category tree, take the citation node children out and pack them
+  % separately, pack the category node, put the citation nodes back in.
+  categorized citations/.style={
+    % #1 = citation box specification; see the example for details. As the spec
+    % is a keylist, we parse it by processing it by pgfkeys in "/citation
+    % tiers" path.  This code does three things (assume we are given spec
+    %   "1=A,2=B,3=C"):
+    % 
+    % 1. An input style (actually, two) is defined for each box. For the
+    % example spec, we'll get styles "1", "2" and "3" (and "1'", "2'",
+    %   "3'"). When applied (by the user), this style creates a citation node as
+    % a child of the category node residing on the appropriate tier.
+    % 
+    % 2. After the nodes are typeset, we create a "tier header": a chain of
+    % auxiliary nodes containing the widest citation from each box. So if node
+    % "citation 1/2/3" is the widest citation in citation box 1/2/3, the
+    % tier header looks like this: % [citation 1 [citation 2 [citation 3]]].
+    % These nodes are crucial for tier alignment; they are how we order the
+    % tiers and thus the citation boxes.
+    % 
+    % 3. A dummy parent node is created for each tier/box. Just before a
+    % category node is packed, its citation nodes are moved away to these
+    % parent nodes (and packed there, nodes on each tier separately); after the
+    % category node is packed, we bring the citation nodes back in.
+    % 
+    tempcounta'=0, % Initialize the box/tier counter.
+    TeX={\pgfqkeys{/citation tiers}{#1}}, % Process the argument.
+    % 
+    % The "/citation tiers" code creates the tier header as a part of "typeset
+    % nodes stage", after the actual typesetting (of course, as we need to know
+    %   the citation node widths). So we have to typeset the tier header
+    % separately. It resides in the last child of the current node.
+    before packing={for nodewalk={fake=last,tree}{typeset node}},
+    % After packing, we can get rid of the tier header.
+    before computing xy={for nodewalk={last,remove}{}},
+    % 
+    % We need to draw stuff in a very particular order, so that the edges from
+    % citation nodes on tier 2 go behind citation box 1, etc.  For details on
+    % "draw tree method", see manual 3.4.3
+    draw tree method/.style={
+      % Draw the category tree (nodes and edges).
+      for filter={tree}{!citation()}{draw tree node, draw tree edge},
+      % Draw the citation boxes (and their contents).
+      draw tier boxes,
+      draw content of tier boxes,
+      % Finally, draw any decorations.
+      for tree=draw tree tikz,
+    }
+  },
+  % The "categorized citations" argument processor.
+  /citation tiers/.unknown/.code={%
+    \let\citationtier\pgfkeyscurrentname
+    \forestset{
+      % Each part of the argument is a "box id=label".  "Box id" = \citationtier,
+      % "label" = #1.  "add citation tier" will also need the current box ordinal
+      % number (tempcounta) and the id of the root of the category tree (as
+      %   this is the current node, that's simply the value of "id").
+      add citation tier/.process=x_RO{\citationtier}{#1}{tempcounta}{id},
+      tempcounta'+=1, % Increment the box counter.
+    }
+  },
+  % Setup stuff related to a particular citation box.
+  add citation tier/.style n args=4{%
+    % #1 = tier name, #2 = label, #3 = tier/box number, #4 = category subtree root id
+    % 
+    % Define the input styles. The only difference between #1 and #1' version
+    % is that the content (##1) is braced in the former.  So ##1 will surely
+    % provide only node content in #1, but can also provide node options in #1'.
+    #1/.style={
+      % The citation node is created as a child of the calling category
+      % node. (It does not matter which child.)
+      prepend={[{##1},
+          % Calling "1=citation" will put "citation" on tier 1.
+          tier=#1,
+          % Ensure uniform tree growth direction (for tier alignment):
+          grow/.option=!u.grow,
+          % Mark as a citation node (we use this in "folder with cites").
+          citation,
+          citation node options, % Apply user customization.
+        ]
+      }
+    },
+    #1'/.style={append={[##1,
+          tier=#1, grow/.option=!u.grow, citation, citation node options,]}},
+    % After we have typeset all the nodes, we can create the tier header
+    % nodes. We dump all the calls of "create tier header node" into style
+    % "typeset nodes stage", for two reasons. First, "create tier header node"
+    % performs a dynamic operation, which is presumably safer to do when not
+    % processing a keylist (such are "before ..."). Second, this must be done
+    % before packing, because that's when we need the tier header.
+    typeset nodes stage/.append style/.process=Rw{tempcounta}{
+      create tier header node={#1}{#4}{##1}
+    },
+    % Prepend the command to draw this particular citation box to "draw tier
+    % boxes".  We *pre*pend because it is crucial that citation boxes are drawn
+    % in reverse order: the idea is that a citation box gets drawn on top of
+    % any edges coming from citation boxes further away from the tree; in
+    % effect, the edges to citations will go below intermediate citation boxes.
+    draw tier boxes/.prefix style={draw tier box={#1}{#4}{#2}},
+    draw content of tier boxes/.prefix style={draw content of tier box={#1}},
+    % Create the dummy temporary parent (#1@temp) for citation nodes of this
+    % tier (#1) --- use the bar version of "create" to set the name immediately
+    % --- and append it to "citations@temp" (see below).
+    for name={citations@temp}{%
+      create'={[,name'={#1@temp}]}, append
+    },
+  },
+  % This is just an auxiliary disociated node (i.e. a node outside the
+  %   hierarchy of the typeset tree) where the dummy parents (one for each
+  %   tier/box) are stored.  We could do without it, but it's helpful because we
+  % can call "do dynamics" (in "folder with cites") on this node to process all
+  % the dummy parents at once.
+  create'={[,name=citations@temp]},
+  % Here we find the widest citation node in the given box, and copy it into
+  % the tier header.
+  create tier header node/.style n args=3{
+    % #1 = tier name
+    % #2 = the root of the category (sub)tree
+    % #3 = embedding level
+    % 
+    % This is the function computing the width:
+    sort by={max_x()-min_x()},
+    for nodewalk={
+      % Visit all the nodes rooted in the category subtree. Filter out anything
+      % not residing on the current tier. Step on the first node with the
+      % maximal width (as specified by "sort by").
+      max={filter={id=#2,descendants}{strequal(tier(),"#1")}}
+    }{
+      for group/.process=_ Ow
+      % Move the node we have stepped on into the tier header. The tier header
+      % starts at the last child of the category tree root.  The second node of
+      % the header is the child of the first node; the third is the child of
+      % the second, etc.  We are currently at the category tree root. So to get
+      % to the final existing node of the header, we step n times to the last
+      % child, where n is the ordinal number of the tier box - 1 (above, the
+      %   "tempcounta" counter, here #3).
+      {id=#2,repeat={#3}{last}}
+      % Grargh, forest should have an "append to" key! Well, this is how it
+      % will be implemented:
+      {id}{append''={!{id={##1}}}},
+    },
+    % Crucially, perform the dynamic operation right away. The next tier header
+    % node we will create will be the child of the one we're creating right now!
+    do dynamics,
+  },
+  % This style draws a citation box and its contents.
+  draw tier box/.style n args=3{
+    % #1 = citation box id
+    % #2 = category tree root id
+    % #3 = citation box label
+    for id={#2}{% go to the root of the category tree
+      % Get the top and bottom of the category tree and the citation box:
+      tempdimya/.max={y()+max_y()}{tree},
+      tempdimyb/.min={y()+min_y()}{tree},
+      % Get the leftmost and the rightmost position in the citation box (i.e the
+      %   given tier):
+      tempdimxa/.max={x()+max_x()}{filter={tree}{strequal(tier(),"#1")}},
+      tempdimxb/.min={x()+min_x()}{filter={tree}{strequal(tier(),"#1")}},
+      % "draw tier box" style is called from the "draw tree method", so we
+      % just draw the citation box directly.
+      TeX/.process=R4Rw5
+      {tempdimxa}{tempdimya}{tempdimxb}{tempdimyb}{citation box label position}{
+        % ##1 -- ##4 = tempdimxa, tempdimya, tempdimxb, tempdimyb
+        % ##5 = "citation box label position" register
+        \node[fit={(##1,##2) (##3,##4)}, citation box options,
+          % The box is labeled by the content of the dummy tier header node.
+          label={[citation box label options]##5:#3}
+        ]{};
+      },
+    }
+  },
+  draw content of tier box/.style={
+    % Draw the citation nodes of this box (i.e. on this tier), and their edges.
+    for filter={tree}{strequal(tier(),"#1")}{draw tree node, draw tree edge},
+  },
+  % An update to the "folder" style from the "edges" library. It (or something
+  %   like it) will be included in the next release of forest.  The idea is to
+  % pack the children normally (caligned to the first child) and then move them
+  % into the appropriate position.
+  folder v2/.style={
+    % The following three parameters can be set immediately ...
+    % Calign to the first child.
+    calign=child,
+    calign primary child=1,
+    % This is necessary for "tempdims" calculation below to work properly.
+    anchor=parent,
+    % ... but the bulk of the work is done just after the node is packed.
+    after packing node={
+      % No children, no work.
+      if n children=0{}{
+        % Just to speed up things ...
+        tempdiml=l_sep(),
+        % s-shift =   the part of the child between the parent and the child
+        % + "s sep"
+        % + the part of the parent between the parent and the child
+        % (Hmm, will this work in general? I have to double-check what
+        %   "max/min_s/l" does.)
+        tempdims={abs(max_s("",""))+s_sep()+abs(min_s("!1",""))},
+        for children={
+          % The "l" of a child is fixed to the parent's "l sep".
+          l'/.register=tempdiml,
+          % The shift direction depends on the direction of the children.
+          s+=tempdims()*(0.5-reversed())*2,
+          edge={rotate/.option=!parent.grow},
+          % We don't use the values of "parent anchor" and "child anchor" here
+          % (we use ".-children last" and ".parent" directly), because the user
+          % might want to use those otherwise if the folder is embedded in a
+          % larger tree.
+          edge path'/.expanded={
+            ([xshift=\forestregister{folder indent}]!u.-children last) |- (.parent)
+          },
+        },
+        fit=band, % to avoid overlapping nodes with their (greatgreat...)uncles.
+      },
+    },
+  },
+  % This is really the heart of the algorithm.  In "folder with cites", we
+  % separate category and citation nodes, and pack them separately. So this
+  % style really does all the work in "before/after packing node": separate
+  % category and citation nodes just before packing, and put them back together
+  % after packing.
+  folder with cites/.style={
+    before packing node={
+      % Move all citation node children into the dummy parent (see the end of
+      %   "add citation tier" def).
+      for children={% Visiting the "files" (the children of the folder)
+        if citation={% but only if they are citation nodes
+          % Umm.
+          % 1. "O" gives us the "tier" name of the current node.
+          % 2. "w" sticks this tier name in place of "##1" in "##1@temp". The
+          % result becomes the first argument of "for name".
+          % 3. "O" gives us the "id" of the node (a "file" in the folder).
+          % 4. "w" sticks this id into the code as "##1".
+          for name/.process=OwOw  {tier}{##1@temp}{id}{
+            % We're now inside node <tiername>@temp
+            % Move the citation node here.
+            append={!{id=##1}},
+            % Inherit the growth direction from the folder (the citation node
+            %   should have the same grow, but just in case.)
+            grow/.option=!{id=##1,parent}.grow,
+            reversed/.option=!{id=##1,parent}.reversed,
+          },
+        }{},
+      },
+      % We have to trigger the dynamic operations manually, because we need
+      % the result immediately (we can't wait for a delay cycle) --- remember
+      % we're in the middle of packing a node! (See the previous answer for
+      %   discussion on "do dynamics").
+      do dynamics, do dynamics=citations@temp,
+    },
+    % Apply the (updated) folder style to whatever children remained in the
+    % original parent.
+    folder v2,
+    % After the folder is packed, it's time to bring the kids back home.
+    after packing node={
+      % If all is right here, the <tiername>@temp nodes were empty of children
+      % prior to "before packing node". So the current node's (temporarily
+      %   absent) children are all the nodes currently residing there. So we can
+      % simply loop through the entire "citations@temp" to visit all the kids.
+      % 
+      % Below, we will refer to the current node's id by "##1".
+      for name/.process=_Ow {citations@temp}{id}{
+        for children={% loop through the tiers/boxes
+          % But before we bring the children back, we will pack them.  And the
+          % trick --- and one of the crucial improvements over the previous
+          % version of "categorized citations" --- is that we will pack the
+          % children of each tier separately!  This avoids some very strange
+          % "l" computations from that version. See, our citation nodes from
+          % different boxes should not interact in the "s" dimension at all,
+          % but if we pack them all together (as in the previous version), they
+          % potentially do.  And the "l" dimension is not a problem, as this is
+          % handled by tier alignment while packing nodes further up the tree.
+          for children={% loop through the moved children on this tier
+            % We are packing the children under a dummy node, so we need to
+            % set the l dimension manually. We want the children to be at least
+            % "s sep" away from the parent, so (the same calculation as for
+            %   "tempdims" in "folder (v2)"):
+            l={abs(max_l("",""))+l_sep("!u")+abs(min_l("!u",""))},
+          },
+          % How should we calign the citation nodes after packing them?
+          citation nodes calign,
+          % Pack (within the dummy parent) the citation nodes of a single
+          % category node and a single citation box ...
+          pack',
+          % ... and then put them back into the original parent. We prepend
+          % because the code below checking for overlaps between the
+          % citations of a node and its children uses "next on tier".
+          for children={
+            for id/.process=_Ow{##1}{id}{
+              prepend={!{id=####1}},
+            },
+          },
+        },
+      },
+      % I'm not even sure we need to do this, but just in case.
+      do dynamics, do dynamics=citations@temp,
+      % THIS IS THE NEW BUGFIX. 
+      % We can still get an overlap between some citation node of this node and
+      % a citation node of some of its children. Let's fix this.
+      for children={
+        if citation={
+          tempdima=0pt,
+          for Nodewalk/.process=__OOw2{on invalid=fake}{next on tier}{!parent.id}{id}{
+            tempdima/.option=max y,
+            for Nodewalk={}{
+              while nodewalk valid={parent}{
+                parent,
+                if id={##1}{break}{tempdimb/.option=s},
+              },
+              if id={##1}{
+                tempdima+/.register=tempdimb,
+                tempdima-/.option={!{id=##2}.min y},
+                tempdima+/.option=s sep,
+              }{
+                tempdima=0pt,
+              },
+            }{},
+          },
+          if tempdima<={0pt}{}{
+            for parent={
+              for children={
+                if citation={}{
+                  s-/.register=tempdima,
+                },
+              },
+            },
+          },
+        }{},
+      },
+    },
+  },
+  % This style will get filled by calls to "draw tier box". It does not get
+  % emptied at the start of "categorized citations" to support multiple
+  % category trees in a single forest tree --- so we rely on the forest
+  % environment being a group.
+  draw tier boxes/.style={},
+  draw content of tier boxes/.style={},
+  % Inserted =======================
+  declare toks={fill}{},
+  autoforward'={fill}{node options},
+  adapt color pct/.style n args=3{%
+    % #1 = the option containing the color
+    % #2 = the option receiving the color
+    % #3 = new percent
+    adapt color pct 1/.style={#2=##1!#3},
+    split option={#1}{!}{adapt color pct 1, adapt color pct 2},
+  },
+  adapt color pct 2/.style={},
+  % ===============================
+  % As the same says ...
+  declare toks register=citation box label position,
+  % This is set to true for citation nodes (upon invocation of an input style).
+  declare boolean={citation}{false},
+  declare boolean register=citation node autoformat,
+}
+
+
+
+\makeatletter
+\forestset{
+  % Let's patch up "do dynamics" --- to be included in the next release of forest.
+  do dynamics/.code={%
+    \the\forest@do@dynamics
+    \forest@do@dynamics{}%
+    \forest@forthis{%
+      \forest@nameandgo{#1}%
+      \forest@node@Compute@numeric@ts@info{\forest@cn}%
+    }%
+  },
+  do dynamics/.default=!{root'},
+}
+\makeatother
+
+
+
+% This is it, as far as the logic goes. Now the formatting.
+\forestset{
+  % A very simple generic style to superimpose two identical SIBLINGS. The user
+  % must make sure that the siblings are of the same size.
+  identify with/.style={% #1 = the relative node name of the sibling to identify with
+    % Hide the current node
+    opacity=0, text opacity=0,
+    % And move it to the position of the given sibling.
+    % 1. Movement can be done by setting "s" and "l" because they are siblings
+    % ("s" and "l" are coordinates relative to the parent and its growth
+    %   direction).
+    % 2.This must be done after "s" and "l" are set (pack stage) but before
+    % computing the paper coordinates. So:
+    before computing xy={
+      s/.option=#1.s,
+      l/.option=#1.l,
+    },
+  },
+}
+
+
+
+
+
+% These are the formatting options and should be (reasonably) safe to adjust.
+\forestset{
+  % This style should be applied (manually) to the root of the category
+  % tree. So the definition will use "for tree" etc. to properly format all the
+  % nodes in the category (sub)tree. Note that the logic of "categorized
+  % citations" does not depend on this style --- with the exception of
+  % expecting either "for tree={grow'=0}" or "for tree={grow=180}".
+  category tree/.style={
+    for tree={
+      % Some basic stuff ...
+      grow'=0, draw, /tikz/align=center, anchor=parent,
+      % For single citation nodes connected to a tree nodes, it even works
+      % without this (assuming that the default parent anchor is center). But for
+      % the fancy "forked edge" calignment of citation nodes, this is necessary.
+      parent anchor=children,
+    },
+    % The shift of the parent anchor for the folder node (a register applying
+    %   to all folder nodes):
+    folder indent=1.25em,
+    % Nodes on levels 0, 1 and 2 are drawn with "forked edge"s.
+    % Nodes on levels 2, 3, ... are folders. There is no limit on the
+    % number of levels.
+    % 
+    % Feel free to change the level where the transition from forked edge to
+    % folders occurs, or even to mix them. Note that key "forked edge" sets the
+    % type of the edge towards the parent node; it must be set for each child.  Key
+    % "folder" (either the original, v2, or "folder with cites"), on the other hand,
+    % influences the positions and edges of its children; it must be only used on
+    % the parent node.
+    % 
+    % We also set text widths, opacities etc. for each level here. The
+    % color is set in the tree itself.
+    % 
+    % We use "relative level", because the root of the category tree might not
+    % be the absolute root of the forest tree.
+    for relative level=0{
+      fill opacity=0.5, text width=2cm, rounded corners=3pt
+    },
+    for relative level=1{
+      fill opacity=0.45, text width=2.5cm, rounded corners=3pt,
+      forked edge
+    },
+    for relative level=2{
+      fill opacity=0.30, text width=2.0cm, rounded corners=3pt,
+      forked edge,
+      % The "l sep" (here and below) influences both the folder--file
+      % distance and the distance to citation nodes.
+      folder with cites, l sep+=0.75em
+    },
+    for relative level=3{
+      fill opacity=0.30, text width=2cm, rounded corners=2pt,
+      folder with cites, l sep+=.75em
+    },
+    for relative level>=4{
+      fill opacity=0.15, text width=1.5cm, rounded corners=2pt,
+      % folder with cites, l sep+=.75em
+    },
+  },
+  % This style is automatically applied to every citation node.  Again: it is
+  % applied to each citation node *separately*.  So don't use "for tree" and
+  % such in here.
+  citation node options/.style={
+    draw, /tikz/align=center, rounded corners=2pt,
+    adapt color pct={!u.fill}{fill}{20},
+    % fill=brown!20,
+    % This sets the separation between the citation boxes:
+    l sep=1.25em,
+    % (How so? The citation nodes get copied into the auxiliary "tier header"
+    %   nodes, along with their "l sep" value. These nodes form a chain of
+    %   embedded nodes, [1[2[3]]], so setting "l sep" on them pushes them apart
+    %   in "l" (x") dimension. And because they live on the same tiers as the
+    %   real citation nodes, those feel this "l sep" as well.)
+    % 
+    % The "anchor=parent" key specifies center vertical alignment to the
+    % parent.  The "child anchor=paren" says that's where the edge will start
+    % too. We most probably want to keep these as they are.
+    anchor=parent, child anchor=parent,
+    % The default citation node text width:
+    text width=2cm,
+    % (Note that a fixed text width is not a requirement for the
+    %   "categorized citations" to work.  Try replacing the above
+    %   "text width=..." by:
+    %   anchor=center
+    %   
+    %   Automatically format content of citation nodes. We offer two
+    %   mechanisms; you can also implement your own, or use none (just comment
+    %     this out).
+    %   1. Wrap in \cite
+    %   content format=\cite{\forestoption{content}},
+    %   2. Split the content of the node (separator is ",") and format the
+    %   parts according to "format (first) citation entry".
+    %   split option={content}{,}{format first citation entry, format citation entry},
+    if citation node autoformat={
+      split option={content}{,}{format first citation entry, format citation entry},
+    }{},
+    % Make sure that the edge to a citation is a simple line.
+    before drawing tree={edge path'={(!u.parent anchor)--(.child anchor)}},
+  },
+  % These two keys are used (by the second content formatting mechanism above)
+  % to build (new) content by concatenating the formatted parts (of the old
+  %   content).
+  format first citation entry/.style={content'=\mbox{[#1]}},
+  format citation entry/.style={content+'=\discretionary{}{}{}\mbox{[#1]}},
+  % How shall we align citations in the unlikely case that we have more than
+  % one citation node belonging to a category node on a single tier (see the
+  %   blue "citation" in the example tree)? Let's have a very fancy setup by
+  % default: center calignment with forked edges, but no "s sep". The
+  % following style is applied to a dummy parent where the packing of the
+  % citation nodes actually takes place:
+  citation nodes calign/.style={
+    calign=center, forked edges, for children={fork sep=2em}, s sep=0,
+    % To push the citation boxes a bit further away from the tree, adjust the
+    % "l sep" of the dummy parent:
+    l sep=1.0em,
+  },
+  % How should a citation box look like? Note that we want "fill opacity=1"
+  % (the default) here, because we want the citation box to partially hide the
+  % edges from citations to the folders.
+  /tikz/citation box options/.style={
+    fill=gray!5, draw=black, dotted, thin,
+  },
+  % Format the citation box labels:
+  /tikz/citation box label options/.style={
+    anchor=base, yshift=1ex,
+  },
+  % Where should the citation box labels appear?
+  citation box label position=north,
+  citation node autoformat=false, % manually changed from true to false!
+}
+
+
+
+
+
+
+\begin{document}
+    \small
+    \begin{forest}
+        [,phantom, reversed,
+            [Parallel closing mechanisms, categorized
+                % e s-distance between the subtrees rooted in the children of that node
+                % 
+                % 
+                citations={Tier1=\RN{1}. Conceptual,Tier2=\RN{2}. Detailed,Tier3=\RN{3}. Prototype cite},
+                % Note that in the new version, the category tree is formatted manually,
+                % by applying "category tree".
+                category tree, fill=gray,
+                %
+                [Compliant mechanisms cite, for tree={fill=brown},
+                    [Lumped,
+                        % Specifying "tier=n" tells forest to put the node into the nth
+                        % citation block.
+                        Tier1={[45]},
+                        Tier2=24,
+                    ]
+                    [Distributed
+                        % The citations are auto-formatted, see "citation node autoformat" and
+                        % "format (first) citation entry" above.
+                        Tier1={1--4,7,9,12--13,18},
+                    ]
+                    [Hybrid,
+                        Tier3={3,5,63,23,\\3,5,63,23,\\3,5,63,23},
+                        [MEMS,
+                            % The citation nodes can be freely mixed with files.
+                            %   [citation
+                            %     [1,tier=1]
+                            %     [3,tier=3]
+                            %   ]
+                            Tier1=11,
+                            Tier3={22,34,53,34,\\43,63,64,34,\\45,64,34},
+                            [Test,
+                                Tier1={12},
+                            ]
+                        ]
+                    ]
+                ]
+                % 
+                [Linkage mechanisms cite,
+                    % An easy way to set the color of the entire subtree. The opacity is set,
+                    % per-level, in "tree node options".
+                    for tree={fill=red}, 
+                    [Reverse motion,
+                        Tier2={3,5,63,23},
+                        Tier3={3,5,63,23,\\3,5,63,23,\\3,5,63,23},
+                    ]
+                    [Parallel motion]
+                    [Crank and slider,
+                        Tier1={22,33,44,55,\newline66},
+                        Tier2={22,33,44,55,\newline66},
+                        Tier3=3,
+                    ]
+                    [Bell crank,
+                        % We put two very tall nodes together here, and everything still works!
+                        Tier2={11--13,15--17,20,22,101--105},
+                    ]
+                    [Straight line,
+                        Tier2=69,
+                    ]
+                ]
+                % 
+                [Mechanical meta materials cite, for tree={fill=blue}
+                    [Bending dominated
+                        % [cit]
+                        % [citation
+                        % Yiihaa, we can even have multiple citation nodes per tree node! And
+                        % we can even control how they are caligned ("citation nodes calign").
+                        %   [1,tier=1]
+                        %   [4,tier=2]
+                        %   [5,tier=2]
+                        %   [3,tier=1]
+                        %   [1,tier=1]
+                        % ]
+                        % [cit
+                        %   [1,tier=1]
+                        % ]
+                    ]
+                    [Stretching dominated
+                        % Any number of folder levels is supported.
+                        % [folder 1
+                        %   [folder 2
+                        % [folder 3
+                        %   [folder 4
+                        % [folder 5
+                        % Node "folder 5" sticks out the most. So if we remove this
+                        % citation, something perhaps unexpected happens. The
+                        % citation boxes will overlap the tree! This happens because
+                        % citation nodes are pushed away by "l sep"s of their
+                        % parents. Manual adjustment of the separation between the
+                        % tree and the citation boxes is possible using "citation
+                        % boxes offset".
+                        %   [24--42,tier=1]
+                        % ]
+                        %   ]
+                        % ]
+                        %   ]
+                        % ]
+                    ]
+                    [Origami inspired]
+                    [Auxetic (v$<$0)]
+                ]
+                [Kinematic origami cite \footnotemark, for tree={fill=yellow}
+                    [Open chain,
+                        Tier3={1,3,4},
+                    ]
+                    [Network,
+                        Tier3={1,3,4},
+                    ]
+                ]
+                [Tendon-driven mechanisms cite, for tree={fill=teal}
+                    [Controllable-TDM,
+                        Tier3={1,3,4},
+                    ]
+                    [Uncontrollable-TDM,
+                        Tier3={1,3,4},
+                    ]
+                ]
+                [Linear actuation cite, for tree={fill=green},
+                    [Hydraulic]
+                    [Pneumatic]
+                    [Electro-mechanical cite
+                        [Screw-driven,
+                            Tier3={1,3,4},
+                        ]
+                        [Belt-driven]
+                    ]
+                ]
+                % [Split rails, for tree={fill=orange},
+                %     Tier3={1,3,4},
+                % ]
+                [Springs, for tree={fill=magenta},
+                    Tier3={1,3,4},
+                ]
+                [Springs very long name to show that connecting line is not aligned properly, for tree={fill=magenta},
+                    Tier3={1,3,4},
+                ]
+                [Springs very long name to show that connecting line is not aligned properly. And an even longer line to make is more obvious, for tree={fill=magenta},
+                    Tier3={1,3,4},
+                ]
+            ]
+        ]
+    \end{forest}
+
+
+\end{document}
